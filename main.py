@@ -31,6 +31,31 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
+# --- دالة استرجاع الجلسة المحفوظة تلقائياً لتفادي طلب تسجيل الدخول كل مرة ---
+async def get_user_client(chat_id):
+    if chat_id in user_clients:
+        client = user_clients[chat_id]
+        try:
+            if not client.is_connected():
+                await client.connect()
+            if await client.is_user_authorized():
+                return client
+        except Exception:
+            pass
+
+    # فحص هل يوجد ملف جلسة محفوظ على السيرفر
+    session_file = f"user_session_{chat_id}.session"
+    if os.path.exists(session_file):
+        try:
+            client = TelegramClient(f"user_session_{chat_id}", API_ID, API_HASH)
+            await client.connect()
+            if await client.is_user_authorized():
+                user_clients[chat_id] = client
+                return client
+        except Exception:
+            pass
+    return None
+
 # دالة مساعدة لتجزئة الرسائل الطويلة وإرسالها بالتتابع
 async def send_chunked_report(event, text):
     lines = text.split("\n")
@@ -49,27 +74,65 @@ async def send_chunked_report(event, text):
 @bot.on(events.NewMessage(pattern="/start"))
 async def start_handler(event):
     chat_id = event.chat_id
-    buttons = [
-        [Button.inline("تسجيل الدخول بالحساب 📱", b"login_start")],
-        [Button.inline("عرض مجموعاتي 📋", b"list_groups")]
-    ]
-    await event.respond(
-        "👋 **أهلاً بك في بوت استخراج وتحليل الأعضاء المتفاعلين.**\n\n"
-        "للبدء، يرجى تسجيل الدخول بحساب التيليجرام المطلوب عبر الزر أدناه.",
-        buttons=buttons
-    )
+    client = await get_user_client(chat_id)
+
+    # إذا كان الحساب مسجلاً مسبقاً لا نطلب الرقم
+    if client:
+        buttons = [
+            [Button.inline("عرض مجموعاتي 📋", b"list_groups")],
+            [Button.inline("تسجيل الخروج 🚪", b"logout")]
+        ]
+        await event.respond(
+            "👋 **أهلاً بك مجدداً!**\n\n"
+            "✅ **حسابك مسجل ومحفوظ مسبقاً.**\n"
+            "يمكنك استعراض مجموعاتك من الزر أدناه أو إرسال رابط أي قروب مباشرة للبدء بالفحص:",
+            buttons=buttons
+        )
+    else:
+        buttons = [
+            [Button.inline("تسجيل الدخول بالحساب 📱", b"login_start")]
+        ]
+        await event.respond(
+            "👋 **أهلاً بك في بوت استخراج وتحليل الأعضاء المتفاعلين.**\n\n"
+            "للبدء، يرجى تسجيل الدخول بحساب التيليجرام المطلوب عبر الزر أدناه.",
+            buttons=buttons
+        )
 
 @bot.on(events.CallbackQuery(data=b"login_start"))
 async def login_start(event):
     chat_id = event.chat_id
+    client = await get_user_client(chat_id)
+    if client:
+        await event.respond("✅ أنت مسجل الدخول بالفعل وحسابك محفوظ! يمكنك استخدام /start والبدء مباشرة.")
+        return
     user_states[chat_id] = {"step": "AWAIT_PHONE"}
     await event.respond("📞 يرجى إرسال رقم الهاتف مع الرمز الدولي (مثال: `+9647700000000`):")
+
+# زر لتسجيل الخروج في حال رغبت بتغيير الحساب مستقبلاً
+@bot.on(events.CallbackQuery(data=b"logout"))
+async def logout_handler(event):
+    chat_id = event.chat_id
+    client = await get_user_client(chat_id)
+    if client:
+        try:
+            await client.log_out()
+        except Exception:
+            pass
+    if chat_id in user_clients:
+        del user_clients[chat_id]
+    session_file = f"user_session_{chat_id}.session"
+    if os.path.exists(session_file):
+        try:
+            os.remove(session_file)
+        except Exception:
+            pass
+    await event.respond("🚪 تم تسجيل الخروج وحذف الجلسة بنجاح. يمكنك تسجيل الدخول بحساب جديد عبر /start.")
 
 @bot.on(events.CallbackQuery(data=b"list_groups"))
 async def show_groups(event):
     chat_id = event.chat_id
-    client = user_clients.get(chat_id)
-    if not client or not await client.is_user_authorized():
+    client = await get_user_client(chat_id)
+    if not client:
         await event.respond("⚠️ لم تقم بتسجيل الدخول بالحساب بعد! اضغط على تسجيل الدخول أولاً.")
         return
 
@@ -113,7 +176,8 @@ async def message_handler(event):
                 "📩 تم إرسال كود التحقق إلى حسابك.\n\n"
                 "⚠️ **تنبيه هام:**\n"
                 "أرسل الكود **مفصولاً بمسافات بين كل رقم** حتى لا يحرقه تيليجرام:\n"
-                "مثال: إذا كان الكود `58291`، أرسله هكذا: `5 8 2 9 1`"
+                "مثال: إذا كان الكود `58291`، أرسله هكذا:\n"
+                "`5 8 2 9 1`"
             )
         except Exception as e:
             await event.respond(f"❌ حدث خطأ أثناء إرسال الكود: {str(e)}")
@@ -134,7 +198,7 @@ async def message_handler(event):
             await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
             user_clients[chat_id] = client
             user_states[chat_id] = {"step": "LOGGED_IN"}
-            await event.respond("✅ تم تسجيل الدخول بنجاح!\nاضغط على 'عرض مجموعاتي' أو أرسل رابط مجموعة مباشرة.")
+            await event.respond("✅ تم تسجيل الدخول وحفظ جلستك بنجاح!\nلن تحتاج لتسجيل الدخول مرة أخرى. اضغط الآن على 'عرض مجموعاتي' أو أرسل رابط قروب مباشرة.")
         except SessionPasswordNeededError:
             user_states[chat_id]["step"] = "AWAIT_2FA"
             await event.respond("🔐 هذا الحساب محمي بكلمة مرور (2FA). يرجى إرسال كلمة المرور:")
@@ -149,14 +213,14 @@ async def message_handler(event):
             await client.sign_in(password=password)
             user_clients[chat_id] = client
             user_states[chat_id] = {"step": "LOGGED_IN"}
-            await event.respond("✅ تم فك القفل بنجاح!\nيمكنك الآن استعراض المجموعات عبر /start.")
+            await event.respond("✅ تم فك القفل وحفظ جلستك بنجاح!\nيمكنك الآن استعراض المجموعات عبر /start أو إرسال رابط قروب مباشرة.")
         except Exception as e:
             await event.respond(f"❌ كلمة المرور غير صحيحة أو حدث خطأ: {str(e)}")
 
     # استلام رابط المجموعة مباشرة
     elif "t.me/" in event.text or event.text.startswith("@"):
-        client = user_clients.get(chat_id)
-        if not client or not await client.is_user_authorized():
+        client = await get_user_client(chat_id)
+        if not client:
             await event.respond("⚠️ يرجى تسجيل الدخول أولاً قبل إرسال الروابط.")
             return
 
@@ -194,7 +258,7 @@ async def start_analysis(event):
     state = user_states.get(chat_id, {})
     group_id = state.get("selected_group")
 
-    client = user_clients.get(chat_id)
+    client = await get_user_client(chat_id)
     if not client or not group_id:
         await event.respond("⚠️ حدث خطأ في استرجاع بيانات المجموعة أو الجلسة.")
         return
@@ -232,11 +296,7 @@ async def start_analysis(event):
                 if sender.bot:
                     continue
                 if sender.id not in users_info:
-                    raw_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip() or "بدون اسم"
-                    # تنظيف الاسم من الرموز التي قد تفسد تنسيق الرسالة
-                    clean_name = raw_name.replace("*", "").replace("_", "").replace("`", "")
                     users_info[sender.id] = {
-                        "name": clean_name,
                         "username": sender.username
                     }
                     users_entities[sender.id] = sender
@@ -253,7 +313,7 @@ async def start_analysis(event):
 
         # 4. فحص هل العضو لا يزال في المجموعة أم غادر باستخدام GetCommonChatsRequest
         for idx, (user_id, msg_cnt) in enumerate(sorted_users, 1):
-            info = users_info.get(user_id, {"name": "مستخدم", "username": None})
+            info = users_info.get(user_id, {"username": None})
             sender_entity = users_entities.get(user_id)
 
             if idx % 10 == 0 or idx == total_users:
@@ -268,7 +328,6 @@ async def start_analysis(event):
                 res = await client(GetCommonChatsRequest(user_id=target, max_id=0, limit=100))
                 common_chat_ids = {c.id for c in res.chats}
 
-                # إذا كانت المجموعة ضمن المجموعات المشتركة فهو متواجد، وإلا فقد غادر
                 if any(gid in common_chat_ids for gid in possible_group_ids):
                     is_present = True
                 else:
@@ -287,7 +346,6 @@ async def start_analysis(event):
 
             record = {
                 "id": user_id,
-                "name": info["name"],
                 "username": info["username"],
                 "count": msg_cnt
             }
@@ -299,32 +357,32 @@ async def start_analysis(event):
 
             await asyncio.sleep(0.08)
 
-        # 5. بناء التقرير النصي المرتب بجدول مباشر
+        # 5. بناء التقرير النصي بدون خانة الاسم
         report_text = f"📊 **إحصائيات تفاعل أعضاء المجموعة**\n"
         report_text += f"🔹 الرسائل المفحوصة: `{count:,}`\n"
         report_text += f"🟢 المتواجدون: `{len(current_members)}` | 🔴 المغادرون: `{len(left_members)}`\n"
         report_text += "━━━━━━━━━━━━━━━━━━━━━\n\n"
 
         report_text += "🟢 **[ الأعضاء المتواجدون حالياً بالقروب ]**\n"
-        report_text += "الترتيب ▫️ الاسم ▫️ المعرف / الآيدي ▫️ التفاعل\n"
+        report_text += "الترتيب ▫️ المعرف / الآيدي ▫️ التفاعل\n"
         report_text += "─────────────────────\n"
 
         if current_members:
             for idx, u in enumerate(current_members, 1):
                 user_ident = f"@{u['username']}" if u['username'] else f"`{u['id']}`"
-                report_text += f"{idx}. **{u['name']}** ▫️ {user_ident} ▫️ 💬 `{u['count']} رسالة`\n"
+                report_text += f"{idx}. {user_ident} ▫️ 💬 `{u['count']} رسالة`\n"
         else:
             report_text += "لا يوجد أعضاء متواجدون حالياً.\n"
 
         report_text += "\n━━━━━━━━━━━━━━━━━━━━━\n"
         report_text += "🔴 **[ الأعضاء الذين غادروا القروب ]**\n"
-        report_text += "الترتيب ▫️ الاسم ▫️ المعرف / الآيدي ▫️ التفاعل\n"
+        report_text += "الترتيب ▫️ المعرف / الآيدي ▫️ التفاعل\n"
         report_text += "─────────────────────\n"
 
         if left_members:
             for idx, u in enumerate(left_members, 1):
                 user_ident = f"@{u['username']}" if u['username'] else f"`{u['id']}`"
-                report_text += f"{idx}. **{u['name']}** ▫️ {user_ident} ▫️ 💬 `{u['count']} رسالة`\n"
+                report_text += f"{idx}. {user_ident} ▫️ 💬 `{u['count']} رسالة`\n"
         else:
             report_text += "لا يوجد أعضاء مغادرون ضمن الرسائل المفحوصة.\n"
 
