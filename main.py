@@ -1,17 +1,16 @@
 import os
-import io
 import asyncio
 from collections import Counter
 from aiohttp import web
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events, Button, utils
 from telethon.tl.types import ChannelParticipantsAdmins, User
+from telethon.tl.functions.messages import GetCommonChatsRequest
 from telethon.errors import (
     SessionPasswordNeededError,
-    FloodWaitError,
-    UserNotParticipantError
+    FloodWaitError
 )
 
-# جلب البيانات من متغيرات البيئة (مع إمكانية القراءة المباشرة إذا تم ضبطها)
+# جلب البيانات من متغيرات البيئة
 API_ID = int(os.getenv("API_ID", "35387422"))
 API_HASH = os.getenv("API_HASH", "c3ab2cdac591ab2963d10080725d4dfa")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8641805003:AAFTxgxVjOLL7Cn2MH9jh46LoZRwX0-kaCo")
@@ -20,11 +19,10 @@ PORT = int(os.getenv("PORT", 8080))
 # تهيئة بوت الإدارة
 bot = TelegramClient("bot_session", API_ID, API_HASH)
 
-# قواميس لحفظ جلسات وحالات المستخدمين
 user_clients = {}
 user_states = {}
 
-# --- خادم ويب مصغر لمنصة Render لضمان عدم توقف الخدمة ---
+# --- خادم ويب مصغر لمنصة Render لضمان بقاء الخدمة نشطة ---
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
@@ -32,6 +30,19 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
+
+# دالة مساعدة لتجزئة الرسائل الطويلة وإرسالها بالتتابع
+async def send_chunked_report(event, text):
+    lines = text.split("\n")
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500:
+            await event.respond(chunk, parse_mode="md")
+            chunk = line + "\n"
+        else:
+            chunk += line + "\n"
+    if chunk.strip():
+        await event.respond(chunk, parse_mode="md")
 
 # --- واجهات البوت ---
 
@@ -67,7 +78,6 @@ async def show_groups(event):
     async for dialog in client.iter_dialogs(limit=25):
         if dialog.is_group:
             btn_data = f"grp_{dialog.id}".encode()
-            # تقصير الاسم لتفادي تجاوز الحد المسموح للأزرار (64 بايت)
             name = (dialog.name[:20] + "..") if len(dialog.name) > 20 else dialog.name
             buttons.append([Button.inline(name, btn_data)])
 
@@ -76,7 +86,7 @@ async def show_groups(event):
     else:
         await event.respond("اختر المجموعة المراد فحصها من القائمة:", buttons=buttons)
 
-# استقبال النصوص لتسجيل الدخول (الرقم، الكود، كلمة المرور، أو رابط مجموعة)
+# استقبال النصوص لتسجيل الدخول والروابط
 @bot.on(events.NewMessage)
 async def message_handler(event):
     if event.text.startswith("/"):
@@ -86,7 +96,7 @@ async def message_handler(event):
     state = user_states.get(chat_id, {})
     step = state.get("step")
 
-    # الخطوة 1: استلام رقم الهاتف
+    # استلام رقم الهاتف
     if step == "AWAIT_PHONE":
         phone = event.text.strip()
         client = TelegramClient(f"user_session_{chat_id}", API_ID, API_HASH)
@@ -101,23 +111,20 @@ async def message_handler(event):
             }
             await event.respond(
                 "📩 تم إرسال كود التحقق إلى حسابك.\n\n"
-                "⚠️ **تنبيه هام جداً:**\n"
-                "نظام حماية تيليجرام يقوم بإلغاء وحرق الكود فوراً إذا تم إرساله كأرقام متصلة داخل المحادثة!\n\n"
-                "لذلك، يرجى إرسال الكود **مفصولاً بمسافات بين كل رقم**:\n"
-                "مثال: إذا كان الكود `58291`، أرسله هكذا:\n"
-                "`5 8 2 9 1`"
+                "⚠️ **تنبيه هام:**\n"
+                "أرسل الكود **مفصولاً بمسافات بين كل رقم** حتى لا يحرقه تيليجرام:\n"
+                "مثال: إذا كان الكود `58291`، أرسله هكذا: `5 8 2 9 1`"
             )
         except Exception as e:
             await event.respond(f"❌ حدث خطأ أثناء إرسال الكود: {str(e)}")
 
-    # الخطوة 2: استلام كود التحقق وتجاوز نظام الحرق التلقائي
+    # استلام كود التحقق
     elif step == "AWAIT_CODE":
-        # استخراج الأرقام فقط وتجاهل المسافات والشَّرَطات تلقائياً
         raw_text = event.text.strip()
         code = "".join(filter(str.isdigit, raw_text))
 
         if not code or len(code) < 5:
-            await event.respond("⚠️ الكود غير صالح. يرجى إرساله مع مسافات (مثال: `5 8 2 9 1`).")
+            await event.respond("⚠️ الكود غير صالح. يرجى إرساله مع وضع مسافة بين كل رقم (مثال: `5 8 2 9 1`).")
             return
 
         client = state["client"]
@@ -127,14 +134,14 @@ async def message_handler(event):
             await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
             user_clients[chat_id] = client
             user_states[chat_id] = {"step": "LOGGED_IN"}
-            await event.respond("✅ تم تسجيل الدخول بالحساب بنجاح!\nاضغط الآن على زر 'عرض مجموعاتي' أو أرسل رابط مجموعة مباشرة.")
+            await event.respond("✅ تم تسجيل الدخول بنجاح!\nاضغط على 'عرض مجموعاتي' أو أرسل رابط مجموعة مباشرة.")
         except SessionPasswordNeededError:
             user_states[chat_id]["step"] = "AWAIT_2FA"
-            await event.respond("🔐 هذا الحساب محمي بالتحقق بخطوتين (2FA). يرجى إرسال كلمة المرور:")
+            await event.respond("🔐 هذا الحساب محمي بكلمة مرور (2FA). يرجى إرسال كلمة المرور:")
         except Exception as e:
             await event.respond(f"❌ خطأ أثناء تسجيل الدخول: {str(e)}")
 
-    # الخطوة 2 (مكرر): استلام كلمة مرور التحقق بخطوتين
+    # استلام كلمة مرور التحقق بخطوتين
     elif step == "AWAIT_2FA":
         client = state["client"]
         password = event.text.strip()
@@ -142,11 +149,11 @@ async def message_handler(event):
             await client.sign_in(password=password)
             user_clients[chat_id] = client
             user_states[chat_id] = {"step": "LOGGED_IN"}
-            await event.respond("✅ تم فك القفل وتسجيل الدخول بنجاح!\nيمكنك الآن استعراض المجموعات عبر /start.")
+            await event.respond("✅ تم فك القفل بنجاح!\nيمكنك الآن استعراض المجموعات عبر /start.")
         except Exception as e:
             await event.respond(f"❌ كلمة المرور غير صحيحة أو حدث خطأ: {str(e)}")
 
-    # إمكانية إرسال رابط المجموعة مباشرة
+    # استلام رابط المجموعة مباشرة
     elif "t.me/" in event.text or event.text.startswith("@"):
         client = user_clients.get(chat_id)
         if not client or not await client.is_user_authorized():
@@ -161,7 +168,6 @@ async def message_handler(event):
         except Exception as e:
             await event.respond(f"❌ تعذر الوصول للمجموعة: {str(e)}")
 
-# استلام خيار المجموعة من الأزرار
 @bot.on(events.CallbackQuery(pattern=b"grp_"))
 async def group_selected(event):
     chat_id = event.chat_id
@@ -176,11 +182,11 @@ async def prompt_message_limit(event, group_name):
     ]
     await event.respond(
         f"📊 اختر نطاق الفحص للمجموعة ({group_name}):\n"
-        "سيتم قراءة الرسائل وتحديد المتفاعلين واستبعاد المشرفين والبوتات.",
+        "سيتم فحص التفاعل وتصنيف المتواجدين والمغادرين وإرسال جدول مباشر.",
         buttons=buttons
     )
 
-# بدء عملية التحليل والفحص
+# بدء عملية الفحص واستخراج الإحصائيات
 @bot.on(events.CallbackQuery(pattern=b"limit_"))
 async def start_analysis(event):
     chat_id = event.chat_id
@@ -193,10 +199,16 @@ async def start_analysis(event):
         await event.respond("⚠️ حدث خطأ في استرجاع بيانات المجموعة أو الجلسة.")
         return
 
-    status_msg = await event.respond(f"⏳ جاري فحص آخر {limit:,} رسالة... يرجى الانتظار، هذه العملية قد تستغرق وقتاً تجنباً لقيود التيليجرام.")
+    status_msg = await event.respond(f"⏳ جاري قراءة الرسائل وتحديد المتفاعلين...")
 
     try:
-        # 1. جلب قائمة المشرفين لاستبعادهم
+        # 1. معرفات القروب الممكنة لمطابقتها في المجموعات المشتركة
+        possible_group_ids = {group_id, abs(group_id)}
+        raw_str = str(abs(group_id))
+        if raw_str.startswith("100") and len(raw_str) > 5:
+            possible_group_ids.add(int(raw_str[3:]))
+
+        # 2. جلب قائمة المشرفين لاستبعادهم
         admins = set()
         try:
             async for admin in client.iter_participants(group_id, filter=ChannelParticipantsAdmins):
@@ -204,54 +216,74 @@ async def start_analysis(event):
         except Exception:
             pass
 
-        # 2. قراءة الرسائل واحتساب التفاعل وتجاهل البوتات والمشرفين
+        # 3. قراءة الرسائل واحتساب التفاعل
         user_counts = Counter()
         users_info = {}
+        users_entities = {}
 
         count = 0
         async for msg in client.iter_messages(group_id, limit=limit):
             count += 1
-            if not msg.sender_id:
+            if not msg.sender_id or msg.sender_id in admins:
                 continue
 
-            # استبعاد المشرفين
-            if msg.sender_id in admins:
-                continue
-
-            # استبعاد البوتات والتأكد من أنه مستخدم عادي
             sender = msg.sender
             if isinstance(sender, User):
                 if sender.bot:
                     continue
                 if sender.id not in users_info:
-                    name = f"{sender.first_name or ''} {sender.last_name or ''}".strip() or "بدون اسم"
-                    username = f"@{sender.username}" if sender.username else "لا يوجد"
-                    users_info[sender.id] = {"name": name, "username": username}
+                    raw_name = f"{sender.first_name or ''} {sender.last_name or ''}".strip() or "بدون اسم"
+                    # تنظيف الاسم من الرموز التي قد تفسد تنسيق الرسالة
+                    clean_name = raw_name.replace("*", "").replace("_", "").replace("`", "")
+                    users_info[sender.id] = {
+                        "name": clean_name,
+                        "username": sender.username
+                    }
+                    users_entities[sender.id] = sender
 
                 user_counts[msg.sender_id] += 1
 
-        # 3. فرز المتواجدين حالياً والمغادرين
+        total_users = len(user_counts)
+        await status_msg.edit(f"⏳ تم العثور على {total_users} عضواً متفاعلاً.\nجاري فحص المتواجدين والمغادرين عبر المجموعات المشتركة...")
+
         current_members = []
         left_members = []
 
-        # الترتيب حسب الأكثر تفاعلاً
         sorted_users = user_counts.most_common()
 
-        for user_id, msg_cnt in sorted_users:
-            info = users_info.get(user_id, {"name": "مستخدم", "username": "لا يوجد"})
-            
-            # فحص هل المستخدم لا يزال عضواً في المجموعة
-            is_present = True
+        # 4. فحص هل العضو لا يزال في المجموعة أم غادر باستخدام GetCommonChatsRequest
+        for idx, (user_id, msg_cnt) in enumerate(sorted_users, 1):
+            info = users_info.get(user_id, {"name": "مستخدم", "username": None})
+            sender_entity = users_entities.get(user_id)
+
+            if idx % 10 == 0 or idx == total_users:
+                try:
+                    await status_msg.edit(f"⏳ جاري فحص حالة الأعضاء ({idx}/{total_users})...")
+                except Exception:
+                    pass
+
+            is_present = False
             try:
-                perms = await client.get_permissions(group_id, user_id)
-                if not perms.is_participant:
+                target = sender_entity if sender_entity else user_id
+                res = await client(GetCommonChatsRequest(user_id=target, max_id=0, limit=100))
+                common_chat_ids = {c.id for c in res.chats}
+
+                # إذا كانت المجموعة ضمن المجموعات المشتركة فهو متواجد، وإلا فقد غادر
+                if any(gid in common_chat_ids for gid in possible_group_ids):
+                    is_present = True
+                else:
                     is_present = False
-            except UserNotParticipantError:
-                is_present = False
+
             except FloodWaitError as f:
                 await asyncio.sleep(f.seconds)
+                try:
+                    res = await client(GetCommonChatsRequest(user_id=target, max_id=0, limit=100))
+                    common_chat_ids = {c.id for c in res.chats}
+                    is_present = any(gid in common_chat_ids for gid in possible_group_ids)
+                except Exception:
+                    is_present = False
             except Exception:
-                is_present = True
+                is_present = False
 
             record = {
                 "id": user_id,
@@ -265,39 +297,41 @@ async def start_analysis(event):
             else:
                 left_members.append(record)
 
-            await asyncio.sleep(0.05)  # تأخير زمني طفيف لتفادي FloodWait
+            await asyncio.sleep(0.08)
 
-        # 4. تجهيز التقرير في ملف نصي UTF-8
-        report = io.StringIO()
-        report.write("=" * 60 + "\n")
-        report.write(f"تقرير الأعضاء المتفاعلين في المجموعة\n")
-        report.write(f"إجمالي الرسائل المحللة: {count}\n")
-        report.write(f"عدد المتواجدين حالياً: {len(current_members)} | عدد المغادرين: {len(left_members)}\n")
-        report.write("=" * 60 + "\n\n")
+        # 5. بناء التقرير النصي المرتب بجدول مباشر
+        report_text = f"📊 **إحصائيات تفاعل أعضاء المجموعة**\n"
+        report_text += f"🔹 الرسائل المفحوصة: `{count:,}`\n"
+        report_text += f"🟢 المتواجدون: `{len(current_members)}` | 🔴 المغادرون: `{len(left_members)}`\n"
+        report_text += "━━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        report.write("--- [ 1. الأعضاء المتواجدون حالياً بالمجموعة (مرتبين حسب الأكثر تفاعلاً) ] ---\n")
-        report.write("الترتيب | الآيدي (ID) | المعرف (Username) | عدد الرسائل | الاسم\n")
-        report.write("-" * 60 + "\n")
-        for idx, u in enumerate(current_members, 1):
-            report.write(f"{idx:<3} | {u['id']:<11} | {u['username']:<15} | {u['count']:<4} رسالة | {u['name']}\n")
+        report_text += "🟢 **[ الأعضاء المتواجدون حالياً بالقروب ]**\n"
+        report_text += "الترتيب ▫️ الاسم ▫️ المعرف / الآيدي ▫️ التفاعل\n"
+        report_text += "─────────────────────\n"
 
-        report.write("\n\n" + "=" * 60 + "\n")
-        report.write("--- [ 2. الأعضاء المتفاعلون الذين غادروا المجموعة ] ---\n")
-        report.write("الترتيب | الآيدي (ID) | المعرف (Username) | عدد الرسائل | الاسم\n")
-        report.write("-" * 60 + "\n")
-        for idx, u in enumerate(left_members, 1):
-            report.write(f"{idx:<3} | {u['id']:<11} | {u['username']:<15} | {u['count']:<4} رسالة | {u['name']}\n")
+        if current_members:
+            for idx, u in enumerate(current_members, 1):
+                user_ident = f"@{u['username']}" if u['username'] else f"`{u['id']}`"
+                report_text += f"{idx}. **{u['name']}** ▫️ {user_ident} ▫️ 💬 `{u['count']} رسالة`\n"
+        else:
+            report_text += "لا يوجد أعضاء متواجدون حالياً.\n"
 
-        report.seek(0)
-        file_data = io.BytesIO(report.getvalue().encode("utf-8"))
-        file_data.name = f"active_members_{group_id}.txt"
+        report_text += "\n━━━━━━━━━━━━━━━━━━━━━\n"
+        report_text += "🔴 **[ الأعضاء الذين غادروا القروب ]**\n"
+        report_text += "الترتيب ▫️ الاسم ▫️ المعرف / الآيدي ▫️ التفاعل\n"
+        report_text += "─────────────────────\n"
 
-        await bot.send_file(
-            chat_id,
-            file_data,
-            caption=f"✅ اكتمل الفحص لآخر {count:,} رسالة بنجاح.\nالملف مقسم لخانتي: المتواجدين حالياً والمغادرين."
-        )
+        if left_members:
+            for idx, u in enumerate(left_members, 1):
+                user_ident = f"@{u['username']}" if u['username'] else f"`{u['id']}`"
+                report_text += f"{idx}. **{u['name']}** ▫️ {user_ident} ▫️ 💬 `{u['count']} رسالة`\n"
+        else:
+            report_text += "لا يوجد أعضاء مغادرون ضمن الرسائل المفحوصة.\n"
+
         await status_msg.delete()
+
+        # إرسال النتيجة كرسائل مرتبة
+        await send_chunked_report(event, report_text)
 
     except Exception as e:
         await event.respond(f"❌ حدث خطأ أثناء التحليل: {str(e)}")
